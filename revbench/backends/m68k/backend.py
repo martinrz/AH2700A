@@ -29,6 +29,27 @@ from revbench.core.isa import (
 _STATIC_ABSOLUTE_MODES = {cs_m68k.M68K_AM_ABSOLUTE_DATA_LONG, cs_m68k.M68K_AM_ABSOLUTE_DATA_SHORT}
 _STATIC_PC_MODES = {cs_m68k.M68K_AM_PCI_DISP}
 
+# disasm/findings.md "The address bias": this firmware family links its code
+# assuming a load address of 0x100000, but the physical image sits at file
+# offset 0 (the low alias only exists for the CPU's reset-time boot fetch, per
+# findings.md's VBR-relocation section). Every absolute jsr/bsr/bra/bcc/lea/pea
+# target in the ROM is consequently either already a physical offset or
+# offset by exactly +ALIAS_BASE from one -- confirmed there by masking every
+# exception-vector target and re-disassembling: the biased interpretation
+# produces coherent ISR code, the raw one doesn't. Mirrors disasm/rd68k.py's
+# `resolve(addr, n)`.
+ALIAS_BASE = 0x100000
+
+
+def resolve_address_bias(addr: int, blob_len: int) -> Optional[int]:
+    """Map a possibly +ALIAS_BASE-biased address to a physical offset within
+    a blob of length `blob_len`, or None if it lands in neither window."""
+    if 0 <= addr < blob_len:
+        return addr
+    if ALIAS_BASE <= addr < ALIAS_BASE + blob_len:
+        return addr - ALIAS_BASE
+    return None
+
 _CALL_MNEMONICS = {"jsr", "bsr"}
 _UNCOND_JUMP_MNEMONICS = {"jmp", "bra"}
 _RETURN_MNEMONICS = {"rts", "rte", "rtr"}
@@ -174,6 +195,88 @@ class M68KBackend(ISABackend):
                 return f"${base:x}(pc,{index})"
         return "?"
 
+    def _extension_word_groups(self, ci) -> Optional[list[tuple[int, str]]]:
+        """Per-operand (byte count, kind) following the 2-byte opcode word,
+        mirroring disasm/rd68k.py's classify_extensions() so
+        format_hex_bytes() can group (and zero-trim "abs" groups) the same
+        way that project's .lst convention does. None if any operand can't
+        be confidently sized (caller falls back to one flat group covering
+        the whole tail)."""
+        remaining = ci.size - 2
+        if remaining <= 0:
+            return []
+        base = ci.mnemonic.split(".", 1)[0]
+        embedded_imm = base in ("moveq", "addq", "subq")
+        groups: list[tuple[int, str]] = []
+        for op in ci.operands:
+            if op.type == cs_m68k.M68K_OP_IMM:
+                if embedded_imm:
+                    continue  # value lives in the opcode word itself
+                groups.append((4 if ci.mnemonic.endswith(".l") else 2, "word"))
+            elif op.type == cs_m68k.M68K_OP_BR_DISP:
+                groups.append((remaining, "word"))
+            elif op.type == cs_m68k.M68K_OP_MEM:
+                am = op.address_mode
+                if am == cs_m68k.M68K_AM_ABSOLUTE_DATA_LONG:
+                    groups.append((4, "abs"))
+                elif am in (cs_m68k.M68K_AM_ABSOLUTE_DATA_SHORT, cs_m68k.M68K_AM_REGI_ADDR_DISP,
+                            cs_m68k.M68K_AM_PCI_DISP, cs_m68k.M68K_AM_AREGI_INDEX_8_BIT_DISP,
+                            cs_m68k.M68K_AM_PCI_INDEX_8_BIT_DISP):
+                    groups.append((2, "word"))
+                elif am in (cs_m68k.M68K_AM_REGI_ADDR, cs_m68k.M68K_AM_REGI_ADDR_POST_INC,
+                            cs_m68k.M68K_AM_REGI_ADDR_PRE_DEC, cs_m68k.M68K_AM_REG_DIRECT_ADDR,
+                            cs_m68k.M68K_AM_REG_DIRECT_DATA):
+                    pass  # no extension word
+                else:
+                    return None
+            elif op.type in (cs_m68k.M68K_OP_REG, cs_m68k.M68K_OP_REG_BITS, cs_m68k.M68K_OP_REG_PAIR):
+                pass
+            else:
+                return None
+        return groups if sum(sz for sz, _ in groups) == remaining else None
+
+    def format_hex_bytes(self, insn: Instruction) -> str:
+        """Matches disasm/rd68k.py's .lst hex-byte convention: the opcode
+        word on its own, then one uppercase group per operand's extension
+        word(s), space-separated (e.g. "11FC 00E0 FA13", not a flat run),
+        with absolute-long address groups zero-trimmed (e.g. "00108144"
+        renders as "108144", matching that tool's format_hex())."""
+        raw = insn.raw_bytes
+        ci = insn.backend_obj
+        if ci is None or len(raw) < 2:
+            return raw.hex().upper()
+        groups = [raw[:2].hex().upper()]
+        specs = self._extension_word_groups(ci)
+        pos = 2
+        if specs is None:
+            rest = raw[2:]
+            if rest:
+                groups.append(rest.hex().upper())
+        else:
+            for size, kind in specs:
+                chunk = raw[pos:pos + size]
+                pos += size
+                if kind == "abs":
+                    chunk = chunk.lstrip(b"\x00") or b"\x00"
+                groups.append(chunk.hex().upper())
+        return " ".join(groups)
+
+    def annotate_op_str(self, insn: Instruction, blob_len: Optional[int] = None) -> str:
+        """disasm/findings.md "The address bias": note a call/jump operand's
+        bias-resolved physical target when the raw operand is
+        +ALIAS_BASE-biased, so the offset the rest of the lab's tooling
+        already accounts for is visible in this listing too."""
+        if blob_len is None or not (insn.flags & (InsnFlags.CALL | InsnFlags.JUMP)):
+            return insn.op_str
+        if insn.flags & InsnFlags.COMPUTED:
+            return insn.op_str
+        for op in insn.operands:
+            if op.kind == OperandKind.ABSOLUTE and op.value is not None and op.value >= ALIAS_BASE:
+                targets = self.direct_targets(insn, blob_len)
+                if targets:
+                    return f"{insn.op_str}  -> ${targets[0]:06x}"
+        return insn.op_str
+
     def _classify_flags(self, ci, operands: tuple[Operand, ...]) -> InsnFlags:
         base = ci.mnemonic.split(".", 1)[0]
         flags = InsnFlags.NONE
@@ -229,7 +332,7 @@ class M68KBackend(ISABackend):
             return ComputedJumpKind.MEMORY_INDIRECT
         return ComputedJumpKind.OTHER
 
-    def direct_targets(self, insn: Instruction) -> Optional[list[int]]:
+    def direct_targets(self, insn: Instruction, blob_len: Optional[int] = None) -> Optional[list[int]]:
         if not (insn.flags & (InsnFlags.CALL | InsnFlags.JUMP | InsnFlags.BRANCH)):
             return []
         if insn.flags & InsnFlags.COMPUTED:
@@ -239,10 +342,15 @@ class M68KBackend(ISABackend):
             if op.type == cs_m68k.M68K_OP_BR_DISP:
                 # 68000.md: PC-relative branch target = (addr of extension word
                 # base, i.e. instruction address + 2) + signed displacement.
+                # Always physical -- computed from insn.address, never carries
+                # the ALIAS_BASE bias (that only applies to absolute operands).
                 return [insn.address + 2 + op.br_disp.disp]
             if op.type == cs_m68k.M68K_OP_MEM:
                 if op.address_mode in _STATIC_ABSOLUTE_MODES:
-                    return [op.imm]
+                    if blob_len is None:
+                        return [op.imm]
+                    resolved = resolve_address_bias(op.imm, blob_len)
+                    return [resolved] if resolved is not None else []
                 if op.address_mode in _STATIC_PC_MODES:
                     return [insn.address + 2 + op.mem.disp]
         return None

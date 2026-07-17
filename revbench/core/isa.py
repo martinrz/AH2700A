@@ -148,11 +148,18 @@ class ISABackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def direct_targets(self, insn: Instruction) -> Optional[list[int]]:
+    def direct_targets(self, insn: Instruction, blob_len: Optional[int] = None) -> Optional[list[int]]:
         """Static branch/call/jump targets. Returns None (not []) when the
         target cannot be determined statically -- that is the deliberate
         signal that this is a computed jump needing trace/heuristic
-        resolution, not a decode failure."""
+        resolution, not a decode failure.
+
+        `blob_len` is optional and defaults to None for backward
+        compatibility; when supplied, a backend MAY use it to resolve an
+        image-specific addressing bias (e.g. M68K's +0x100000 VBR-relocation
+        bias -- see backends/m68k/backend.py's resolve_address_bias()) so a
+        biased absolute target still lands inside the loaded blob. Without
+        it, a backend returns the raw operand address unresolved."""
         raise NotImplementedError
 
     @abstractmethod
@@ -188,6 +195,23 @@ class ISABackend(ABC):
         tooltip. Must never raise for an unrecognized mnemonic -- fall back to
         a generic message instead."""
         return f"{insn.mnemonic} {insn.op_str} (no semantic description available for this backend yet)"
+
+    def format_hex_bytes(self, insn: Instruction) -> str:
+        """Display text for `insn.raw_bytes`, for any UI showing a
+        disassembly listing. Default is a flat lowercase hex run; a backend
+        may override to match its own project's established listing
+        convention (e.g. M68K groups bytes per opcode/extension-word and
+        uppercases them -- see backends/m68k/backend.py)."""
+        return insn.raw_bytes.hex()
+
+    def annotate_op_str(self, insn: Instruction, blob_len: Optional[int] = None) -> str:
+        """Operand display text for a listing view. Default: `insn.op_str`
+        unchanged. A backend may override to append a note resolving its own
+        image-specific addressing quirks (e.g. M68K appends the physical
+        target when an operand carries its +0x100000 VBR-relocation bias --
+        see backends/m68k/backend.py). `blob_len` is optional; omit it (or
+        pass None) to get the unannotated `op_str`."""
+        return insn.op_str
 
 
 _NO_DESCRIPTION_SUFFIX = "(no semantic description available for this backend yet)"

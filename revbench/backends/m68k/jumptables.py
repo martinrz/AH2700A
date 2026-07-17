@@ -15,7 +15,7 @@ from typing import Optional
 
 import capstone.m68k as cs_m68k
 
-from revbench.backends.m68k.backend import mem_base_reg
+from revbench.backends.m68k.backend import mem_base_reg, resolve_address_bias
 from revbench.core.formats import printable_ascii_density
 from revbench.core.isa import ComputedJumpKind, Instruction, ISABackend, ResolvedTarget
 
@@ -115,14 +115,23 @@ def resolve_pointer_table(
 
     if table_base is None:
         return None
+    # disasm/findings.md "The address bias": a static table-base load is an
+    # absolute operand, so it's as likely to carry the firmware's +0x100000
+    # VBR-relocation bias as any jsr/bsr target -- resolve it the same way.
+    table_base = resolve_address_bias(table_base, len(blob))
+    if table_base is None:
+        return None
 
     targets: list[int] = []
     for i in range(_MAX_POINTER_ENTRIES):
         word = blob[table_base + i * 4: table_base + i * 4 + 4]
         if len(word) < 4:
             break
-        (value,) = struct.unpack(">I", word)
-        if value == 0 or value % 2 != 0 or value >= len(blob):
+        (raw_value,) = struct.unpack(">I", word)
+        if raw_value == 0 or raw_value % 2 != 0:
+            break
+        value = resolve_address_bias(raw_value, len(blob))
+        if value is None:
             break
         targets.append(value)
 
@@ -147,9 +156,13 @@ def scan_dispatch_table(
         handler_bytes = blob[rec + handler_ptr_offset: rec + handler_ptr_offset + 4]
         if len(name_bytes) < 4 or len(handler_bytes) < 4:
             break
-        (name_ptr,) = struct.unpack(">I", name_bytes)
-        (handler_ptr,) = struct.unpack(">I", handler_bytes)
-        if not (0 <= name_ptr < len(blob)) or not (0 <= handler_ptr < len(blob)) or handler_ptr % 2 != 0:
+        (raw_name_ptr,) = struct.unpack(">I", name_bytes)
+        (raw_handler_ptr,) = struct.unpack(">I", handler_bytes)
+        if raw_handler_ptr % 2 != 0:
+            break
+        name_ptr = resolve_address_bias(raw_name_ptr, len(blob))
+        handler_ptr = resolve_address_bias(raw_handler_ptr, len(blob))
+        if name_ptr is None or handler_ptr is None:
             break
         text = blob[name_ptr: name_ptr + 32]
         nul = text.find(b"\x00")

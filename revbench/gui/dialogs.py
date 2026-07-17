@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from revbench.analysis import dyntrace, jumptrace
+from revbench.gui import session as sessionmod
 from revbench.gui.widgets.scrolled import scrolled_tree
 from revbench.gui.widgets.tooltip import tip
 
@@ -22,7 +24,7 @@ class JumpTraceDialog(tk.Toplevel):
         self.dynamic_targets: dict[int, list[int]] = {}
 
         insn = self._instructions()[jump_index]
-        kind = app.image_backend.is_computed_jump(insn)
+        kind = app.ctx.image_backend.is_computed_jump(insn)
         self.title(f"Jump Trace -- {insn.mnemonic} @ {insn.address:#x}")
         self.geometry("580x380")
 
@@ -62,14 +64,14 @@ class JumpTraceDialog(tk.Toplevel):
         self.status_label.pack(anchor="w", padx=8, pady=(0, 8))
 
     def _instructions(self):
-        return self.app.current_block_result.block.instructions
+        return self.app.ctx.current_block_result.block.instructions
 
     def _resolve(self) -> None:
         try:
             cj = jumptrace.resolve(
-                self.app.image_backend, self.app.image_blob, self._instructions(), self.jump_index,
+                self.app.ctx.image_backend, self.app.ctx.image_blob, self._instructions(), self.jump_index,
                 self.app.jump_cache, dynamic_targets=self.dynamic_targets or None,
-                image_name=self.app.image_name,
+                image_name=self.app.ctx.name,
             )
         except ValueError as exc:
             messagebox.showerror("Not a computed jump", str(exc))
@@ -98,8 +100,8 @@ class JumpTraceDialog(tk.Toplevel):
             messagebox.showerror("Invalid input", "Enter comma-separated addresses, e.g. 0x1a300, 0x1a320")
             return
         cj = jumptrace.resolve_manual(
-            self.app.image_backend, self._instructions(), self.jump_index, self.app.jump_cache,
-            targets, image_name=self.app.image_name,
+            self.app.ctx.image_backend, self._instructions(), self.jump_index, self.app.jump_cache,
+            targets, image_name=self.app.ctx.name,
         )
         self.app.jump_cache.save()
         self._show_result(cj)
@@ -119,3 +121,60 @@ class JumpTraceDialog(tk.Toplevel):
         self.app.status_var.set(
             f"Jump @ {cj.address:#x}: {len(cj.targets)} target(s), {cj.resolution_source or 'unresolved'}")
         self.app._update_live_info()
+
+
+class ResumeSessionDialog(tk.Toplevel):
+    """Startup prompt: resume a known project, start a new session, or open
+    a session.cfg browsed to directly. Shown before the main window's tabs
+    are populated -- see gui/app.py's main()."""
+
+    def __init__(self, root: tk.Tk):
+        super().__init__(root)
+        self.title("Resume session?")
+        self.geometry("420x160")
+        self.result: sessionmod.ProjectEntry | None = None
+        self.transient(root)
+        self.grab_set()
+
+        entries = sessionmod.list_projects()
+        ttk.Label(self, text="Resume a previous revbench session?").pack(anchor="w", padx=10, pady=(10, 4))
+
+        self.choice_var = tk.StringVar(value=entries[0].name if entries else "")
+        combo = ttk.Combobox(self, textvariable=self.choice_var, state="readonly",
+                              values=[e.name for e in entries], width=40)
+        combo.pack(anchor="w", padx=10, pady=(0, 10))
+        self._entries_by_name = {e.name: e for e in entries}
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        tip(ttk.Button(bar, text="Resume selected", command=self._resume),
+            "Reopen the selected project's binary (and listing, if attached)."
+            ).pack(side="left")
+        tip(ttk.Button(bar, text="New session...", command=self._new),
+            "Skip resuming -- start empty and use New Session... yourself."
+            ).pack(side="left", padx=(6, 0))
+        tip(ttk.Button(bar, text="Open session file...", command=self._open_file),
+            "Browse to a session.cfg directly (e.g. one copied in from elsewhere)."
+            ).pack(side="left", padx=(6, 0))
+
+        self.protocol("WM_DELETE_WINDOW", self._new)
+
+    def _resume(self) -> None:
+        self.result = self._entries_by_name.get(self.choice_var.get())
+        self.destroy()
+
+    def _new(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def _open_file(self) -> None:
+        path = filedialog.askopenfilename(title="Open session file", filetypes=[("session.cfg", "session.cfg")])
+        if path:
+            self.result = sessionmod.register_from_session_cfg(Path(path))
+        self.destroy()
+
+    @classmethod
+    def ask(cls, root: tk.Tk) -> "sessionmod.ProjectEntry | None":
+        dialog = cls(root)
+        root.wait_window(dialog)
+        return dialog.result

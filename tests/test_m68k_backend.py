@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from revbench.backends.m68k.backend import M68KBackend
+from revbench.backends.m68k.backend import ALIAS_BASE, M68KBackend, resolve_address_bias
 from revbench.core.isa import ComputedJumpKind, OperandKind
 
 cs = pytest.importorskip("capstone")
@@ -164,3 +164,75 @@ def test_explain_never_crashes_on_any_decoded_instruction(backend):
         insn = decode(backend, hexstr)
         text = backend.explain(insn)
         assert isinstance(text, str) and text
+
+
+# --- disasm/findings.md "The address bias" (+0x100000 VBR-relocation bias) ---
+
+def test_resolve_address_bias_passes_through_physical_address():
+    assert resolve_address_bias(0x500, blob_len=0x80000) == 0x500
+
+
+def test_resolve_address_bias_resolves_biased_address():
+    # jsr $108144.l in a 512 KB image corresponds to physical offset 0x8144
+    # (disasm/findings.md's worked example, same shape: addr - ALIAS_BASE).
+    assert resolve_address_bias(0x108144, blob_len=0x80000) == 0x8144
+
+
+def test_resolve_address_bias_none_when_neither_window_fits():
+    assert resolve_address_bias(0x200000, blob_len=0x80000) is None
+
+
+def test_direct_targets_without_blob_len_returns_raw_address(backend):
+    # Backward-compatible default: omit blob_len, get the unresolved operand.
+    insn = decode(backend, "4EB90010814400", addr=0x1000)  # jsr $108144.l
+    assert backend.direct_targets(insn) == [ALIAS_BASE + 0x8144]
+
+
+def test_direct_targets_with_blob_len_resolves_the_bias(backend):
+    insn_bytes = bytes.fromhex("4EB9") + (ALIAS_BASE + 0x8144).to_bytes(4, "big")
+    blob = bytearray(0x80000)
+    blob[0x1000:0x1000 + len(insn_bytes)] = insn_bytes
+    insn = backend.disassemble_one(bytes(blob), 0x1000)
+    assert backend.direct_targets(insn, blob_len=0x80000) == [0x8144]
+
+
+def test_direct_targets_with_blob_len_empty_when_truly_out_of_range(backend):
+    insn_bytes = bytes.fromhex("4EB9") + (0x300000).to_bytes(4, "big")  # neither window fits
+    blob = bytearray(0x80000)
+    blob[0x1000:0x1000 + len(insn_bytes)] = insn_bytes
+    insn = backend.disassemble_one(bytes(blob), 0x1000)
+    assert backend.direct_targets(insn, blob_len=0x80000) == []
+
+
+def test_direct_targets_branch_displacement_is_never_biased(backend):
+    # PC-relative targets are computed from insn.address -- passing blob_len
+    # must not perturb them even though it activates bias resolution for
+    # absolute operands.
+    insn = decode(backend, "61000010", addr=0x1000)  # bsr.w
+    assert backend.direct_targets(insn, blob_len=0x80000) == [0x1012]
+
+
+def test_format_hex_bytes_groups_per_operand(backend):
+    # clr.b $fa13.w -- opcode word + one 2-byte absolute-short extension,
+    # matching disasm/AH2700A_fw.lst's rendering of this exact instruction.
+    insn = decode(backend, "4238FA13")
+    assert backend.format_hex_bytes(insn) == "4238 FA13"
+
+
+def test_format_hex_bytes_move_immediate_word_then_absolute_short(backend):
+    # move.b #$e0,$fa13.w -- opcode word, 2-byte immediate, 2-byte absolute.
+    insn = decode(backend, "11FC00E0FA13")
+    assert backend.format_hex_bytes(insn) == "11FC 00E0 FA13"
+
+
+def test_annotate_op_str_appends_resolved_target_for_biased_call(backend):
+    insn_bytes = bytes.fromhex("4EB9") + (ALIAS_BASE + 0x8144).to_bytes(4, "big")
+    blob = bytearray(0x80000)
+    blob[0x1000:0x1000 + len(insn_bytes)] = insn_bytes
+    insn = backend.disassemble_one(bytes(blob), 0x1000)
+    assert backend.annotate_op_str(insn, blob_len=0x80000) == f"${ALIAS_BASE + 0x8144:x}.l  -> $008144"
+
+
+def test_annotate_op_str_unchanged_without_blob_len(backend):
+    insn = decode(backend, "4EB9000012340000")  # jsr $1234.l
+    assert backend.annotate_op_str(insn) == insn.op_str

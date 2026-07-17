@@ -23,6 +23,17 @@ def build(notebook: ttk.Notebook, app) -> ttk.Frame:
         "First address of the byte range to evaluate (hex)."
         ).pack(side="left", padx=(2, 12))
 
+    ttk.Label(bar, text="Bookmark:").pack(side="left")
+    bookmark_var = tk.StringVar()
+    bookmark_combo = ttk.Combobox(bar, textvariable=bookmark_var, state="readonly", width=24)
+    bookmark_combo.pack(side="left", padx=(2, 12))
+    bookmark_combo.bind("<<ComboboxSelected>>", lambda e: app._on_bookmark_selected())
+    tip(bookmark_combo,
+        "Labels imported from a disassembly listing (Import listing... on the "
+        "context bar). Picking one fills Start addr."
+        )
+    app.bookmark_var, app.bookmark_combo = bookmark_var, bookmark_combo
+
     ttk.Label(bar, text="Length:").pack(side="left")
     len_var = tk.StringVar()
     tip(ttk.Entry(bar, textvariable=len_var, width=10),
